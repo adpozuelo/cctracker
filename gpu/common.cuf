@@ -1,0 +1,63 @@
+! ==============================================================================
+! MODULE: mod_common (GPU / CUDA Fortran)
+! ==============================================================================
+! DESCRIPTION:
+!   Global definitions, CUDA device/managed memory structures, and simulation
+!   geometry variables for GPU-accelerated cluster center analysis.
+!   Defines CUDA execution parameters (cuda_n_threads = 64, cuda_n_blocks),
+!   device arrays (dev_side, dev_side_div_2, dev_distances), and managed derived
+!   types (dev_configuration) for automatic host-device memory coherence.
+!
+! DATA STRUCTURES:
+!   - configuration: Host-side storage for snapshot metadata and center coordinates.
+!   - dev_configuration: CUDA managed type enabling direct kernel access to per-frame
+!     cluster center positions and counts without explicit manual transfers.
+!   - center: Host-side representation of tracked cluster trajectory coordinates.
+!
+! AUTHORS:
+!   Antonio Díaz Pozuelo   - adiaz@iqf.csic.es
+!   Enrique Lomba          - enrique.lomba@csic.es
+!   Instituto de Química Física Blas Cabrera (IQF-CSIC)
+!
+! DATE:
+!   September 2026
+! ==============================================================================
+module mod_common
+    use, intrinsic :: iso_fortran_env, only: sp=>real32, dp=>real64
+    use cudafor
+    implicit none
+    character(:), allocatable :: input_filename
+    character(:), allocatable :: centers_filename
+    character(:), allocatable :: trajectories_filename
+    character(:), allocatable :: histogram_filename
+    integer, parameter :: n_dim = 3, cuda_n_threads = 64
+    integer :: time_steps, cuda_n_blocks
+    integer :: min_n_centers = 1000000, max_n_centers = 0, diff_max_min_n_centers
+    integer, allocatable :: clusters_time_life(:,:)
+    integer, allocatable :: clusters_time_steps(:)
+    integer, allocatable :: clusters_time_life_hist(:)
+    real(sp) :: min_distance = 1000000_sp
+    real(sp) :: side(n_dim), side_div_2(n_dim)
+    real(sp), device :: dev_side(n_dim), dev_side_div_2(n_dim)
+    real(sp), allocatable :: host_distances(:)
+    real(sp), allocatable, device :: dev_distances(:)
+    type :: configuration
+        integer :: id
+        integer :: n_centers
+        real(sp), allocatable :: centers(:,:)
+    end type
+    type(configuration), allocatable :: host_configurations(:)
+    type :: dev_configuration
+        integer, managed :: id
+        integer, managed :: n_centers
+        real(sp), allocatable, managed :: centers(:,:)
+    end type
+    type(dev_configuration), allocatable, managed :: dev_configurations(:)
+    type :: center
+        real(sp) :: coordinate(n_dim) = 0.0_sp
+    end type
+    type(center), allocatable :: host_trajectories(:,:)
+    save
+contains
+    
+end module mod_common

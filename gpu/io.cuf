@@ -1,0 +1,265 @@
+! ==============================================================================
+! MODULE: mod_io (GPU / CUDA Fortran)
+! ==============================================================================
+! DESCRIPTION:
+!   Input and output subsystem for GPU-accelerated cluster center tracking.
+!   Manages host and CUDA device/managed memory allocation, parses LAMMPS
+!   trajectory dumps ('centers.lammpstrj'), transfers coordinates to CUDA managed
+!   data structures, writes All-Time-Living (ATL) and full cluster trajectories,
+!   and outputs cluster lifetime histograms.
+!
+! AUTHORS:
+!   Antonio Díaz Pozuelo   - adiaz@iqf.csic.es
+!   Enrique Lomba          - enrique.lomba@csic.es
+!   Instituto de Química Física Blas Cabrera (IQF-CSIC)
+!
+! DATE:
+!   September 2026
+! ==============================================================================
+module mod_io
+    use, intrinsic :: iso_fortran_env, only: sp=>real32, dp=>real64
+    use mod_common
+    use mod_distances
+    use cudafor
+    integer :: nsteps(100000)
+    implicit none
+contains
+
+! ==============================================================================
+! SUBROUTINE: read_input_file
+! ==============================================================================
+! DESCRIPTION:
+!   Reads simulation control parameters from 'Input' file.
+!   Retrieves time_steps and allocates host and device configuration arrays,
+!   initializing device distance buffers for the GPU kernel.
+!
+! ARGUMENTS:
+!   None. Reads input_filename and allocates/initializes:
+!     - time_steps: Number of snapshots
+!     - host_configurations, dev_configurations
+!     - host_distances, dev_distances
+!
+! AUTHORS:
+!   Antonio Díaz Pozuelo   - adiaz@iqf.csic.es
+!   Enrique Lomba          - enrique.lomba@csic.es
+!
+! DATE:
+!   September 2026
+! ==============================================================================
+    subroutine read_input_file()
+        integer :: io
+        print *, 'Reading input file: ', input_filename
+        open(newunit=io, file=input_filename, status='old', action='read')
+        read(io,*) time_steps
+        close(io)
+        allocate(host_configurations(time_steps))
+        allocate(dev_configurations(time_steps))
+        allocate(host_distances(time_steps))
+        host_distances = 1000000_sp
+        allocate(dev_distances(time_steps))
+        dev_distances = host_distances
+    end subroutine read_input_file
+
+! ==============================================================================
+! SUBROUTINE: read_centers_file
+! ==============================================================================
+! DESCRIPTION:
+!   Parses the LAMMPS trajectory dump file 'centers.lammpstrj'.
+!   Extracts orthogonal box dimensions to host and device variables (side, dev_side),
+!   determines cluster count ranges across frames, allocates tracking structures,
+!   and reads per-snapshot center coordinates into managed GPU device structures.
+!
+! ARGUMENTS:
+!   None. Operates on global state variables from mod_common.
+!
+! METHOD:
+!   Performs two sequential passes over the LAMMPS trajectory dump:
+!     Pass 1: Reads box bounds and header blocks to determine min and max cluster
+!             counts for memory allocation sizing.
+!     Pass 2: Reads particle coordinates into host arrays and mirrors them into
+!             CUDA managed device structures (dev_configurations(i)%centers).
+!
+! AUTHORS:
+!   Antonio Díaz Pozuelo   - adiaz@iqf.csic.es
+!   Enrique Lomba          - enrique.lomba@csic.es
+!
+! DATE:
+!   September 2026
+! ==============================================================================
+    subroutine read_centers_file()
+        integer :: io, i, j, k, trash1, trash2, trash3, id
+        print *, 'Reading centers file: ', centers_filename
+        open(newunit=io, file=centers_filename, status='old', action='read')
+        do i = 1, 5
+            read(io,*)
+        end do
+        do i = 1, n_dim
+            read(io,*) low(i), high(i)
+        end do
+        side = high-low
+        dev_side = side
+        side_div_2 = side / 2.0
+        dev_side_div_2 = side_div_2
+        rewind(unit=io)
+        do i = 1, time_steps
+            host_configurations(i)%id = i
+            dev_configurations(i)%id = i
+            read(io,*)
+            read(io,*) nsteps(i)
+            read(io,*)
+            read(io,*) host_configurations(i)%n_centers
+            if (host_configurations(i)%n_centers < min_n_centers) &
+                min_n_centers = host_configurations(i)%n_centers
+            if (host_configurations(i)%n_centers > max_n_centers) &
+                max_n_centers = host_configurations(i)%n_centers
+            dev_configurations(i)%n_centers = host_configurations(i)%n_centers
+            do k = 1, 5
+                read(io,*)
+            end do
+            do j = 1, host_configurations(i)%n_centers
+                read(io,*)
+            end do
+        end do
+        rewind(unit=io)
+        allocate(clusters_time_life(max_n_centers, time_steps))
+        clusters_time_life = 0
+        allocate(host_trajectories(max_n_centers, time_steps))
+        allocate(clusters_time_steps(max_n_centers))
+        allocate(clusters_time_life_hist(time_steps))
+        clusters_time_life_hist = 0
+        do i = 1, time_steps
+            id = mod(host_configurations(i)%n_centers, min_n_centers) + 1
+            allocate(host_configurations(i)%centers(n_dim, host_configurations(i)%n_centers))
+            allocate(dev_configurations(i)%centers(n_dim, host_configurations(i)%n_centers))
+            do k = 1, 9
+                read(io,*)
+            end do
+            do j = 1, host_configurations(i)%n_centers
+                read(io,*) trash1, trash2, trash3, host_configurations(i)%centers(1,j), &
+                    host_configurations(i)%centers(2,j), host_configurations(i)%centers(3,j)
+            end do
+            dev_configurations(i)%centers = host_configurations(i)%centers
+        end do
+        close(io)
+    end subroutine read_centers_file
+
+! ==============================================================================
+! SUBROUTINE: write_trajectories_atl
+! ==============================================================================
+! DESCRIPTION:
+!   Writes trajectories of All-Time-Living (ATL) clusters (clusters that exist
+!   uninterrupted from the initial to the final time step) to a LAMMPS trajectory
+!   dump file (default: 'centers_atl.lammpstrj').
+!
+! ARGUMENTS:
+!   None. Operates on global variables from mod_common:
+!     - max_n_centers: Total number of tracked cluster IDs
+!     - clusters_time_steps: Total surviving frame count per cluster
+!     - host_trajectories: Coordinate and velocity trajectory history
+!     - trajectories_filename: Output file path
+!
+! AUTHORS:
+!   Antonio Díaz Pozuelo   - adiaz@iqf.csic.es
+!   Enrique Lomba          - enrique.lomba@csic.es
+!
+! DATE:
+!   September 2026
+! ==============================================================================
+    subroutine write_trajectories_atl()
+        integer :: io, i, j, s, n_clusters_tmp = 0, id_tmp
+        print *, 'Writing trajectories (life every time step): ', trajectories_filename
+        do i = 1, max_n_centers
+            if (clusters_time_steps(i) == time_steps) then
+                n_clusters_tmp = n_clusters_tmp + 1
+            end if
+        end do
+        open(newunit=io, file=trajectories_filename, status='replace', action='write')
+        do i = 1, time_steps
+            write(io,"('ITEM: TIMESTEP'/I12/'ITEM: NUMBER OF ATOMS'/I12/'ITE&
+                 &M: BOX BOUNDS pp pp pp')") nsteps(i), n_clusters_tmp
+            do s = 1, n_dim
+                write(io,"(2f15.7)") low(s), high(s)
+            end do
+            write(io,"('ITEM: ATOMS id type id x y z vx vy vz')")
+            id_tmp = 1
+            do j = 1, max_n_centers
+                if (clusters_time_steps(j) == time_steps) then
+                    write(io,'(2i10,6f15.7)') id_tmp, 1,  host_trajectories(j,i)%coordinate, host_trajectories(j,i)%velocity
+                    id_tmp = id_tmp + 1
+                end if
+            end do
+        end do
+        close(io)  
+    end subroutine write_trajectories_atl
+    
+! ==============================================================================
+! SUBROUTINE: write_trajectories
+! ==============================================================================
+! DESCRIPTION:
+!   Exports full reconstructed trajectories of all tracked cluster centers
+!   across all time steps to a LAMMPS trajectory dump file.
+!
+! ARGUMENTS:
+!   None. Operates on global tracking structures from mod_common.
+!
+! AUTHORS:
+!   Antonio Díaz Pozuelo   - adiaz@iqf.csic.es
+!   Enrique Lomba          - enrique.lomba@csic.es
+!
+! DATE:
+!   September 2026
+! ==============================================================================
+    subroutine write_trajectories()
+        integer :: io, i, j, s, n_clusters_tmp, id_tmp
+        print *, 'Writing trajectories: ', trajectories_filename
+        open(newunit=io, file=trajectories_filename, status='replace', action='write')
+        do i = 1, time_steps
+            write(io,"('ITEM: TIMESTEP'/I12/'ITEM: NUMBER OF ATOMS'/I12/'ITE&
+                 &M: BOX BOUNDS pp pp pp')") nsteps(i), max_n_centers
+            do s = 1, n_dim
+                write(io,"(2f15.7)")low(s), high(s)
+            end do
+            write(io,"('ITEM: ATOMS id type id x y z')")
+            do j = 1, max_n_centers
+                write(io,'(3i10,3f15.7)') j, 1, j, host_trajectories(j,i)%coordinate
+            end do
+        end do
+        close(io)
+    end subroutine write_trajectories
+    
+! ==============================================================================
+! SUBROUTINE: write_histogram_life_time
+! ==============================================================================
+! DESCRIPTION:
+!   Builds and exports the exact cluster lifetime distribution histogram to
+!   an ASCII data file (default: 'centers_atl_histogram.dat'). Records the count
+!   of clusters observed for each discrete lifetime duration.
+!
+! ARGUMENTS:
+!   None. Operates on global variables from mod_common:
+!     - clusters_time_steps: Lifetime per cluster
+!     - clusters_time_life_hist: Lifetime histogram frequency accumulator
+!     - histogram_filename: Target output file
+!
+! AUTHORS:
+!   Antonio Díaz Pozuelo   - adiaz@iqf.csic.es
+!   Enrique Lomba          - enrique.lomba@csic.es
+!
+! DATE:
+!   September 2026
+! ==============================================================================
+    subroutine write_histogram_life_time()
+        integer :: io, i
+        print *, 'Writing life time histogram: ', histogram_filename
+        do i = 1, max_n_centers
+            clusters_time_life_hist(clusters_time_steps(i)) = clusters_time_life_hist(clusters_time_steps(i)) + 1
+        end do
+        open(newunit=io, file=histogram_filename, status='replace', action='write')
+        write(io,*) '#   t_step  count'
+        do i = 1, time_steps
+           if (clusters_time_life_hist(i) /= 0) write(io,'(2i8)') i, clusters_time_life_hist(i)     
+        end do
+        close(io)
+    end subroutine write_histogram_life_time
+
+end module mod_io

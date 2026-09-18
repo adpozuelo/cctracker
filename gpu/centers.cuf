@@ -1,0 +1,76 @@
+! ==============================================================================
+! PROGRAM: centers (GPU / CUDA Fortran)
+! ==============================================================================
+! DESCRIPTION:
+!   GPU-accelerated cluster center trajectory tracking and lifetime analysis
+!   for molecular dynamics and Monte Carlo simulations.
+!   Utilizes CUDA Fortran to massively parallelize pairwise distance evaluations
+!   across simulation time steps using managed and device memory. Reconstructs
+!   cluster trajectories across frames, extracts All-Time-Living (ATL) persistent
+!   clusters into LAMMPS format, and computes exact cluster lifetime histograms.
+!
+! FEATURES:
+!   - Massively parallel GPU evaluation of minimum pairwise distances (CUDA)
+!   - CUDA Managed Memory for seamless host-device data exchange
+!   - 3D periodic boundary conditions with minimum image convention
+!   - Cluster trajectory continuity tracking across consecutive time frames
+!   - Extraction of persistent All-Time-Living (ATL) cluster trajectories
+!   - Export of exact per-timestep cluster lifetime survival histograms
+!
+! AUTHORS:
+!   Antonio Díaz Pozuelo   - adiaz@iqf.csic.es
+!   Enrique Lomba          - enrique.lomba@csic.es
+!   Instituto de Química Física Blas Cabrera (IQF-CSIC)
+!
+! DATE:
+!   September 2026
+! ==============================================================================
+program centers
+    use, intrinsic :: iso_fortran_env, only: sp=>real32, dp=>real64
+    use mod_common
+    use mod_io
+    use mod_distances
+    use mod_trajectories
+    use cudafor
+    implicit none
+    integer :: i, istat
+    character(:), allocatable :: directory
+
+    directory='lowdens_500K'
+    input_filename=directory//'/'//'Input'
+    centers_filename=directory//'/'//'centers.lammpstrj'
+    trajectories_filename=directory//'/'//'centers_atl.lammpstrj'
+    histogram_filename=directory//'/'//'centers_atl_histogram.dat'
+
+    call read_input_file()
+    call read_centers_file()
+
+    print *, 'Simulation data:'
+    print *, 'time_steps = ', time_steps
+    print *, 'side = ', side
+    print *, 'min_n_centers = ', min_n_centers
+    print *, 'max_n_centers = ', max_n_centers
+    
+    ! print *, '*** CPU ***'
+    ! call cpu_centers_min_distance()
+    ! print *, 'min_distance**2 = ', min_distance
+    ! print *, 'min_distance = ', sqrt(min_distance)
+    
+    print *, '*** GPU ***'
+    print *, 'Processing minimal distances...'
+    cuda_n_blocks = time_steps / cuda_n_threads
+    if (mod(cuda_n_blocks, cuda_n_threads) > 0) cuda_n_blocks = cuda_n_blocks + 1
+    print *, 'cuda_n_threads = ', cuda_n_threads
+    print *, 'cuda_n_blocks = ', cuda_n_blocks
+    call gpu_centers_min_distance<<<cuda_n_blocks,cuda_n_threads>>>(time_steps, n_dim)
+    istat = cudaDeviceSynchronize()
+    host_distances = dev_distances
+    min_distance = minval(host_distances)
+    print *, 'min_distance = ', sqrt(min_distance)
+
+    print *, '*** CPU ***'
+    call cpu_trajectories_analysis()
+    call write_trajectories_atl()
+    call write_histogram_life_time()
+
+end program centers

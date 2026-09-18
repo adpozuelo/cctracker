@@ -1,0 +1,93 @@
+! ==============================================================================
+! MODULE: mod_trajectories (GPU / CUDA Fortran)
+! ==============================================================================
+! DESCRIPTION:
+!   Cluster center trajectory reconstruction and lifetime tracking across
+!   simulation snapshots.
+!
+! AUTHORS:
+!   Antonio Díaz Pozuelo   - adiaz@iqf.csic.es
+!   Enrique Lomba          - enrique.lomba@csic.es
+!   Instituto de Química Física Blas Cabrera (IQF-CSIC)
+!
+! DATE:
+!   September 2026
+! ==============================================================================
+module mod_trajectories
+    use, intrinsic :: iso_fortran_env, only: sp=>real32, dp=>real64
+    use mod_common
+    use cudafor
+    implicit none
+contains
+
+! ==============================================================================
+! SUBROUTINE: cpu_trajectories_analysis
+! ==============================================================================
+! DESCRIPTION:
+!   Reconstructs continuous trajectories of cluster centers across consecutive
+!   time steps. Links centers between time t and t+1 using the distance threshold
+!   min_distance (computed by the GPU kernel) under periodic boundary conditions.
+!   Tracks binary frame-by-frame cluster survival in clusters_time_life and
+!   evaluates total cluster lifetimes in clusters_time_steps.
+!
+! ARGUMENTS:
+!   None. Operates on global data structures from mod_common:
+!     - time_steps: Total snapshot count
+!     - host_configurations: Per-frame cluster coordinates
+!     - host_trajectories: Tracked trajectory coordinate history
+!     - clusters_time_life: Frame survival indicator matrix
+!     - clusters_time_steps: Lifetime accumulator per cluster
+!     - min_distance: Squared distance cutoff for trajectory linking
+!
+! METHOD:
+!   1. Seeds initial cluster center positions at t = 1.
+!   2. For each step i from 1 to time_steps - 1:
+!      For each active cluster j at step i:
+!        Searches candidate centers k at step i+1.
+!        Applies minimum image PBC to compute squared distance.
+!        If distance < min_distance, links center k to trajectory j and marks
+!        clusters_time_life(j, i+1) = 1.
+!   3. Sums lifetimes: clusters_time_steps(i) = sum(clusters_time_life(i,:)).
+!
+! AUTHORS:
+!   Antonio Díaz Pozuelo   - adiaz@iqf.csic.es
+!   Enrique Lomba          - enrique.lomba@csic.es
+!
+! DATE:
+!   September 2026
+! ==============================================================================
+subroutine cpu_trajectories_analysis()
+    integer :: i, j, k, s, ii
+    real(sp) :: distance
+    real(sp) :: distance_arr(n_dim)
+    print *, "Proccesing analysis of trajectories..."
+    do i = 1, host_configurations(1)%n_centers
+        host_trajectories(i,1)%coordinate = host_configurations(1)%centers(:,i)
+        clusters_time_life(i,1) = 1
+    end do
+    do i = 1, time_steps - 1
+        ii = i + 1
+        do j = 1, max_n_centers
+            do k = 1, host_configurations(ii)%n_centers
+                if (clusters_time_life(j,i) == 1) then
+                    do s = 1, n_dim
+                        distance_arr(s) = host_trajectories(j,i)%coordinate(s) - host_configurations(ii)%centers(s,k)
+                        if (distance_arr(s) > side_div_2(s)) distance_arr(s) = distance_arr(s) - side(s)
+                        if (distance_arr(s) < -side_div_2(s)) distance_arr(s) = distance_arr(s) + side(s)
+                        distance_arr(s) = distance_arr(s) * distance_arr(s) 
+                    end do
+                    distance = sum(distance_arr)
+                    if (distance < min_distance) then
+                        host_trajectories(j,ii)%coordinate = host_configurations(ii)%centers(:,k)
+                        clusters_time_life(j,ii) = 1
+                    end if
+                end if 
+            end do
+        end do
+    end do
+    do i = 1, max_n_centers
+        clusters_time_steps(i) = sum(clusters_time_life(i,:))
+    end do
+end subroutine cpu_trajectories_analysis
+
+end module mod_trajectories
