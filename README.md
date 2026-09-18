@@ -195,7 +195,7 @@ cd gpu
 ## Output Files
 
 1. **`centers_atl.lammpstrj`**:  
-   Trajectory file in standard LAMMPS dump format containing exclusively the All-Time-Living (ATL) clusters that survived across all time steps ($t = 1 \dots \text{time\_steps}$). Ideal for direct visualization in VMD or OVITO:
+   Trajectory file in standard LAMMPS dump format containing exclusively the All-Time-Living (ATL) clusters that survived across all $T$ simulation time steps ($t = 1, \dots, T$, as defined in `Input`). Ideal for direct visualization in VMD or OVITO:
    ```bash
    vmd centers_atl.lammpstrj
    ```
@@ -232,7 +232,7 @@ cd gpu
 
 For an orthogonal simulation box of lengths $\mathbf{L} = (L_x, L_y, L_z)$ centered with boundaries $[x_{\text{low}}, x_{\text{high}}]$, the minimum image displacement vector $\Delta \mathbf{r} = (\Delta x, \Delta y, \Delta z)$ between two cluster centers $j$ and $k$ is calculated component-wise:
 
-$$\Delta s = s_j - s_k, \quad s \in \{x, y, z\}$$
+$$\Delta s = s_j - s_k \quad (s = x, y, z)$$
 
 $$\Delta s_{\text{PBC}} = \begin{cases}
 \Delta s - L_s & \text{if } \Delta s > \frac{L_s}{2} \\
@@ -246,17 +246,24 @@ $$r_{jk}^2 = \Delta x_{\text{PBC}}^2 + \Delta y_{\text{PBC}}^2 + \Delta z_{\text
 
 ### 2. CUDA Minimum Distance Evaluation (`gpu_centers_min_distance`)
 
-To evaluate the minimum cluster separation across large trajectory ensembles efficiently, the GPU implementation maps simulation snapshots directly to CUDA threads:
+To evaluate the minimum cluster separation across large trajectory ensembles efficiently, the GPU implementation maps each simulation snapshot directly to a CUDA thread:
 
-$$\text{thread\_id} = (\text{blockidx\%x} - 1) \times \text{blockdim\%x} + \text{threadidx\%x}$$
+$$t = (b_x - 1) \cdot D_x + t_x$$
 
-Each active thread ($\text{thread\_id} \le \text{time\_steps}$) independently iterates over all unique pairs of cluster centers in snapshot $\text{thread\_id}$:
+where $b_x$, $D_x$, and $t_x$ represent block index, block dimension, and thread index respectively:
+```fortran
+thread_id = (blockidx%x - 1) * blockdim%x + threadidx%x
+```
 
-$$j \in [1, N_{\text{centers}} - 1], \quad k \in [j + 1, N_{\text{centers}}]$$
+Each active thread with snapshot index $t \le T$ independently iterates over all unique pairs of cluster centers present in snapshot $t$:
+
+$$j \in [1, N_c(t) - 1], \quad k \in [j + 1, N_c(t)]$$
+
+where $N_c(t)$ is the number of cluster centers at time step $t$.
 
 Threads execute conflict-free evaluations entirely in device memory, writing the local snapshot minimum to `dev_distances(thread_id)`. The host retrieves `dev_distances` and performs a reduction to determine the global minimum distance:
 
-$$d_{\min} = \sqrt{\min_{t} \left\{ d_{\text{dev}}^2(t) \right\}}$$
+$$d_{\min} = \sqrt{\min_{t} \left[ d_{\text{dev}}^2(t) \right]}$$
 
 ### 3. Temporal Trajectory Linking
 
@@ -273,13 +280,15 @@ The lifetime $\tau_c$ of cluster trajectory $c$ is the total number of frames in
 
 $$\tau_c = \sum_{t=1}^{T} \Lambda(c, t)$$
 
-A cluster is classified as an **All-Time-Living (ATL)** cluster if and only if:
+where $\Lambda(c, t) = 1$ if cluster $c$ exists at frame $t$, and $0$ otherwise.
 
-$$\tau_c = T = \text{time\_steps}$$
+A cluster is classified as an **All-Time-Living (ATL)** cluster if and only if it survives throughout all $T$ simulation snapshots:
 
-The fraction of ATL clusters relative to the total number of distinct clusters processed $N_{\text{proc}}$ is:
+$$\tau_c = T$$
 
-$$\%_{\text{ATL}} = \left( \frac{N_{\text{ATL}}}{N_{\text{proc}}} \right) \times 100$$
+The percentage of ATL clusters relative to the total number of distinct clusters processed $N_{\text{proc}}$ is:
+
+$$P_{\text{ATL}} = \left( \frac{N_{\text{ATL}}}{N_{\text{proc}}} \right) \times 100$$
 
 ---
 
@@ -306,9 +315,9 @@ flowchart TD
 
 ## Performance Tips
 
-- **CUDA Thread Configuration:** The GPU code defaults to `cuda_n_threads = 64` per block. For systems with large numbers of snapshots ($> 10^4$), tuning this value (e.g., 128 or 256) in `gpu/common.cuf` can improve warp occupancy.
+- **CUDA Thread Configuration:** The GPU code defaults to `cuda_n_threads = 64` per block. For systems with large numbers of snapshots (> 10,000 frames), tuning this value (e.g., 128 or 256) in `gpu/common.cuf` can improve warp occupancy.
 - **Unified Memory:** The use of `managed` memory in `dev_configuration` simplifies memory transfers. Ensure your NVIDIA driver has unified memory support enabled.
-- **Memory Scaling:** The parameter `max_3n_centers` dynamically scales memory to $10 \times \max(N_{\text{centers}})$, providing a generous headroom for cluster nucleation events.
+- **Memory Scaling:** The parameter `max_3n_centers` dynamically scales memory to $10 \times \max(N_c)$, providing a generous headroom for cluster nucleation events.
 
 ---
 
